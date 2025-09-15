@@ -1,0 +1,8 @@
+[phases.install]
+cmd = "pip install -r requirements.txt"
+
+[phases.build]
+cmd = "echo 'Build complete'"
+
+[start]
+cmd = "streamlit run k2_inventory_app_v4.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
