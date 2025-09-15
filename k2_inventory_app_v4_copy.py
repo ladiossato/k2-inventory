@@ -164,8 +164,7 @@ REQUEST_WINDOWS = {
 }
 
 AVONDALE_DELIVERY_WEEKDAYS = {0, 3}  # Monday=0, Thursday=3 (existing)
-COMMISSARY_DELIVERY_WEEKDAYS = {1, 3, 5}  # Tuesday=1, Thursday=3, Saturday=5
-
+COMMISSARY_DELIVERY_WEEKDAYS = {0, 2, 4}  # Monday=0, Wednesday=2, Friday=4
 
 AVONDALE_REQUEST_WINDOWS = {
     1: {"label": "Thursday Delivery", "total_days": 6.5},  # Tuesday 08:00
@@ -173,9 +172,9 @@ AVONDALE_REQUEST_WINDOWS = {
 }
 
 COMMISSARY_REQUEST_WINDOWS = {
-    0: {"label": "Tuesday Delivery", "total_days": 2.5},   # Monday 08:00
-    2: {"label": "Thursday Delivery", "total_days": 2.5},  # Wednesday 08:00  
-    4: {"label": "Saturday Delivery", "total_days": 2.5},  # Friday 08:00
+    6: {"label": "Monday Delivery", "total_days": 2.5},    # Sunday 08:00
+    1: {"label": "Wednesday Delivery", "total_days": 2.5}, # Tuesday 08:00  
+    3: {"label": "Friday Delivery", "total_days": 2.5},    # Thursday 08:00
 }
 
 # Keep original for backward compatibility
@@ -353,35 +352,8 @@ def init_db():
                     pass
                 conn.commit()
             
-            # ADDED: Check if location columns exist, add if missing
-            try:
-                conn.execute("SELECT location FROM nightly_on_hand LIMIT 1")
-                LOG.info("Location columns already exist")
-            except sqlite3.OperationalError:
-                LOG.info("Adding location support to database schema...")
-                try:
-                    conn.execute("ALTER TABLE nightly_on_hand ADD COLUMN location TEXT DEFAULT 'Avondale'")
-                    LOG.info("Added location column to nightly_on_hand")
-                except sqlite3.OperationalError as e:
-                    if "duplicate column name" not in str(e).lower():
-                        LOG.warning(f"Could not add location to nightly_on_hand: {e}")
-                
-                try:
-                    conn.execute("ALTER TABLE transfers ADD COLUMN location TEXT DEFAULT 'Avondale'")
-                    LOG.info("Added location column to transfers")
-                except sqlite3.OperationalError as e:
-                    if "duplicate column name" not in str(e).lower():
-                        LOG.warning(f"Could not add location to transfers: {e}")
-                
-                try:
-                    conn.execute("ALTER TABLE auto_requests ADD COLUMN location TEXT DEFAULT 'Avondale'")
-                    LOG.info("Added location column to auto_requests")
-                except sqlite3.OperationalError as e:
-                    if "duplicate column name" not in str(e).lower():
-                        LOG.warning(f"Could not add location to auto_requests: {e}")
-                
-                conn.commit()
-                LOG.info("Location schema migration completed")
+            # FIXED: Use the proper location migration function
+            check_and_migrate_location_columns(conn)
             
             # Seed items if empty or update existing items
             cur = conn.execute("SELECT COUNT(*) AS n FROM items")
@@ -409,6 +381,49 @@ def init_db():
                 
     except Exception as e:
         LOG.error("Database initialization failed: %s", e)
+        raise
+
+def check_and_migrate_location_columns(conn: sqlite3.Connection):
+    """Fixed location column migration with proper data population."""
+    try:
+        # Check if location columns exist
+        cursor = conn.execute("PRAGMA table_info(nightly_on_hand)")
+        onhand_columns = [col[1] for col in cursor.fetchall()]
+        
+        cursor = conn.execute("PRAGMA table_info(transfers)")  
+        transfers_columns = [col[1] for col in cursor.fetchall()]
+        
+        cursor = conn.execute("PRAGMA table_info(auto_requests)")
+        requests_columns = [col[1] for col in cursor.fetchall()]
+        
+        migrations_needed = []
+        
+        # Add missing location columns
+        if 'location' not in onhand_columns:
+            conn.execute("ALTER TABLE nightly_on_hand ADD COLUMN location TEXT DEFAULT 'Avondale'")
+            migrations_needed.append('nightly_on_hand')
+            
+        if 'location' not in transfers_columns:
+            conn.execute("ALTER TABLE transfers ADD COLUMN location TEXT DEFAULT 'Avondale'")
+            migrations_needed.append('transfers')
+            
+        if 'location' not in requests_columns:
+            conn.execute("ALTER TABLE auto_requests ADD COLUMN location TEXT DEFAULT 'Avondale'")
+            migrations_needed.append('auto_requests')
+        
+        if migrations_needed:
+            # Update existing NULL records
+            conn.execute("UPDATE nightly_on_hand SET location = 'Avondale' WHERE location IS NULL")
+            conn.execute("UPDATE transfers SET location = 'Avondale' WHERE location IS NULL")  
+            conn.execute("UPDATE auto_requests SET location = 'Avondale' WHERE location IS NULL")
+            
+            conn.commit()
+            LOG.info(f"Location columns added to: {', '.join(migrations_needed)}")
+        else:
+            LOG.info("Location columns already exist")
+            
+    except Exception as e:
+        LOG.error(f"Location migration failed: {e}")
         raise
 
 def cleanup_old_data():
@@ -474,31 +489,6 @@ def check_system_health():
     
     return health_status
 
-# ------------------------ backward compatibility functions -----------------------
-
-def next_delivery_after(d: date) -> date:
-    """Backward compatibility - defaults to Avondale schedule"""
-    return next_delivery_after_location(d, 'Avondale')
-
-def days_until_delivery(count_date: date) -> float:
-    """Backward compatibility - defaults to Avondale schedule"""
-    return days_until_delivery_location(count_date, 'Avondale')
-
-def calculate_item_status(name: str, qty: Optional[float], count_date: date, adu: float, par_level: float, unit_type: str) -> ItemStatus:
-    """Backward compatibility - defaults to Avondale location"""
-    return calculate_item_status_location(name, qty, count_date, adu, par_level, unit_type, 'Avondale')
-
-def get_item_status_for_date(conn: sqlite3.Connection, d: date) -> List[ItemStatus]:
-    """Backward compatibility - defaults to Avondale location"""
-    return get_item_status_for_date_location(conn, d, 'Avondale')
-
-def handle_submit(entry_type: str, entry_date: date, manager: str, notes: str, qty_inputs: Dict[str, Optional[float]]) -> int:
-    """Backward compatibility - defaults to Avondale location"""
-    return handle_submit_with_location(entry_type, entry_date, manager, notes, qty_inputs, 'Avondale')
-
-def format_reassurance_message(items_status: List[ItemStatus], check_date: date) -> str:
-    """Backward compatibility - defaults to Avondale location"""
-    return format_reassurance_message_location(items_status, check_date, 'Avondale')
 
 # ---------------------- Time Helpers -----------------------
 def today_local() -> date:
@@ -560,6 +550,134 @@ def calculate_item_status_location(name: str, qty: Optional[float], count_date: 
     
     return ItemStatus(name, qty, status, consumption_need, par_gap, par_level, adu, unit_type, days_to_delivery, days_coverage)
 
+
+# Add these functions right here:
+
+def next_delivery_after(d: date) -> date:
+    """Backward compatibility - defaults to Avondale schedule"""
+    return next_delivery_after_location(d, 'Avondale')
+
+def days_until_delivery(count_date: date) -> float:
+    """Backward compatibility - defaults to Avondale schedule"""
+    return days_until_delivery_location(count_date, 'Avondale')
+
+def calculate_item_status(name: str, qty: Optional[float], count_date: date, adu: float, par_level: float, unit_type: str) -> ItemStatus:
+    """Backward compatibility - defaults to Avondale location"""
+    return calculate_item_status_location(name, qty, count_date, adu, par_level, unit_type, 'Avondale')
+
+def get_item_status_for_date(conn: sqlite3.Connection, d: date) -> List[ItemStatus]:
+    """Backward compatibility - defaults to Avondale location"""
+    return get_item_status_for_date_location(conn, d, 'Avondale')
+
+def handle_submit(entry_type: str, entry_date: date, manager: str, notes: str, qty_inputs: Dict[str, Optional[float]]) -> int:
+    """Backward compatibility - defaults to Avondale location"""
+    return handle_submit_with_location(entry_type, entry_date, manager, notes, qty_inputs, 'Avondale')
+
+def format_reassurance_message(items_status: List[ItemStatus], check_date: date) -> str:
+    """Backward compatibility - defaults to Avondale location"""
+    return format_reassurance_message_location(items_status, check_date, 'Avondale')
+
+def map_oh_for_date_flexible_location(conn: sqlite3.Connection, target_date: date, location: str = None) -> Dict[str, Tuple[float, str]]:
+    """Return most recent On-Hand qty and unit_type per item on or before target_date for specific location."""
+    out: Dict[str, Tuple[float, str]] = {}
+    
+    # Get items for specific location or all items
+    if location:
+        items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
+        items_query = "SELECT name, unit_type FROM items WHERE active = TRUE AND name IN ({})".format(
+            ','.join(['?'] * len(items_config))
+        )
+        items = conn.execute(items_query, list(items_config.keys())).fetchall()
+    else:
+        items = conn.execute("SELECT name, unit_type FROM items WHERE active = TRUE").fetchall()
+    
+    for item in items:
+        name = item["name"]
+        unit_type = item["unit_type"]
+        
+        # Look for most recent on-hand data on or before target_date for location
+        if location:
+            recent = conn.execute("""
+                SELECT qty FROM nightly_on_hand oh
+                JOIN items i ON oh.item_id = i.id
+                WHERE i.name = ? AND oh.d <= ? AND oh.location = ?
+                ORDER BY oh.d DESC, oh.created_at DESC
+                LIMIT 1
+            """, (name, target_date.isoformat(), location)).fetchone()
+        else:
+            recent = conn.execute("""
+                SELECT qty FROM nightly_on_hand oh
+                JOIN items i ON oh.item_id = i.id
+                WHERE i.name = ? AND oh.d <= ?
+                ORDER BY oh.d DESC, oh.created_at DESC
+                LIMIT 1
+            """, (name, target_date.isoformat())).fetchone()
+        
+        if recent and recent["qty"] is not None:
+            qty = float(recent["qty"])
+        else:
+            qty = 0.0
+            
+        out[name] = (qty, unit_type)
+    
+    return out
+
+# ADD this new location-aware auto-request data storage
+def store_auto_request_data_location(requests: List[Tuple[str, float, float, float]], request_date: date, delivery_date: date, location: str):
+    """Store auto-request data with location for shortage comparison later."""
+    try:
+        with get_db_connection() as conn:
+            ts = now_local().isoformat()
+            
+            for name, req_qty, on_hand, adu in requests:
+                if req_qty > 0:  # Only store items that were actually requested
+                    item_id = conn.execute("SELECT id FROM items WHERE name = ?", (name,)).fetchone()
+                    if item_id:
+                        conn.execute(
+                            "INSERT INTO auto_requests(item_id, request_date, delivery_date, requested_qty, on_hand_qty, location, created_at) VALUES (?,?,?,?,?,?,?)",
+                            (item_id["id"], request_date.isoformat(), delivery_date.isoformat(), req_qty, on_hand, location, ts)
+                        )
+            
+            conn.commit()
+            LOG.info(f"Stored auto-request data for {len([r for r in requests if r[1] > 0])} {location} items")
+            
+    except Exception as e:
+        LOG.error(f"Failed to store auto-request data for {location}: {e}")
+
+# ADD this new location-aware info message formatter
+def format_auto_request_info_message_location(request_data: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date, location: str) -> str:
+    """Location-aware detailed information message for managers."""
+    style = MessageStyle()
+    
+    # Use location-specific request windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
+    
+    header = f"<b>🪣 AUTO-REQUEST ANALYSIS - {location.upper()}</b>\n"
+    header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n"
+    header += f"🚚 For: <b>{window['label']}</b>\n"
+    header += f"📊 Coverage: {window['total_days'] + DEFAULT_BUFFER_DAYS:.1f} days\n"
+    header += f"📋 Based on most recent inventory count\n"
+    
+    lines = [header, f"\n<b>📊 DETAILED ANALYSIS:</b>"]
+    
+    for name, req_qty, on_hand, adu, unit_type in request_data:
+        current_display = format_unit_display(on_hand, unit_type)
+        
+        if req_qty > 0:
+            coverage_days = on_hand / adu if adu > 0 else 0
+            need_display = format_unit_display(req_qty, unit_type)
+            lines.append(f"\n<b>{name}</b>:")
+            lines.append(f"  Current: {current_display} ({coverage_days:.1f} days)")
+            lines.append(f"  Daily use: {adu:g} • Need: <b>{need_display}</b>")
+        else:
+            lines.append(f"\n<b>{name}</b>: Fully stocked ({current_display})")
+    
+    return "\n".join(lines)
 
 # ------------------- Enhanced Telegram Messaging -------------------
 def tg_send_with_retry(chat_id: int, text: str, max_retries: int = 3) -> bool:
@@ -1069,61 +1187,83 @@ def auto_request_quantities(run_weekday: int, oh_by_item: Dict[str, Tuple[float,
 # FIXED: Update format_unit_display to handle whole numbers cleanly
 
 def job_auto_request():
-    """Auto-request job with two-message format and data storage."""
+    """FIXED: Auto-request job with location-aware calculations."""
     try:
         with get_db_connection() as conn:
             now = now_local()
             wd = now.weekday()
+            today = now.date()
             
-            if wd not in REQUEST_WINDOWS:
+            # Check both location schedules
+            avondale_should_run = wd in AVONDALE_REQUEST_WINDOWS
+            commissary_should_run = wd in COMMISSARY_REQUEST_WINDOWS
+            
+            if not avondale_should_run and not commissary_should_run:
+                LOG.info(f"No auto-request scheduled for {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][wd]}")
                 return
                 
-            LOG.info("Auto-request job running (%s)", REQUEST_WINDOWS[wd]["label"])
+            LOG.info("Auto-request job running for applicable locations")
             
-            # Use most recent available data (today first, then yesterday)
-            today = now.date()
-            oh_map = map_oh_for_date_flexible(conn, today)
+            messages_sent = 0
             
-            # Check data completeness - use the actual retrieved quantities
-            missing_items = [name for name, (qty, _) in oh_map.items() if qty == 0.0]
-            if len(missing_items) > len(oh_map) * 0.5:
-                LOG.warning("Too many items missing from recent counts")
-                alert_msg = f"<b>⚠️ AUTO-REQUEST SKIPPED</b>\nInsufficient recent on-hand data\nMissing: {', '.join(missing_items[:5])}{'...' if len(missing_items) > 5 else ''}"
+            # Process Avondale if scheduled
+            if avondale_should_run:
+                oh_map_avondale = map_oh_for_date_flexible_location(conn, today, 'Avondale')
+                missing_items = [name for name, (qty, _) in oh_map_avondale.items() if qty == 0.0]
+                
+                if len(missing_items) <= len(oh_map_avondale) * 0.5:  # Less than 50% missing
+                    delivery_date = next_delivery_after_location(today, 'Avondale')
+                    avondale_requests = generate_location_requests('Avondale', wd, oh_map_avondale)
+                    
+                    # Store request data
+                    store_auto_request_data_location(avondale_requests, today, delivery_date, 'Avondale')
+                    
+                    # Send messages
+                    info_message = format_auto_request_info_message_location(avondale_requests, wd, today, 'Avondale')
+                    order_message = format_location_order_message(avondale_requests, wd, today, 'Avondale')
+                    
+                    tg_send_with_retry(CHAT_AUTOREQUEST, info_message)
+                    time_module.sleep(2)
+                    tg_send_with_retry(CHAT_AUTOREQUEST, order_message)
+                    messages_sent += 1
+                else:
+                    LOG.warning("Avondale: Too many items missing from recent counts")
+            
+            # Process Commissary if scheduled
+            if commissary_should_run:
+                if messages_sent > 0:
+                    time_module.sleep(2)  # Delay between location messages
+                    
+                oh_map_commissary = map_oh_for_date_flexible_location(conn, today, 'Commissary')
+                missing_items = [name for name, (qty, _) in oh_map_commissary.items() if qty == 0.0]
+                
+                if len(missing_items) <= len(oh_map_commissary) * 0.5:  # Less than 50% missing
+                    delivery_date = next_delivery_after_location(today, 'Commissary')
+                    commissary_requests = generate_location_requests('Commissary', wd, oh_map_commissary)
+                    
+                    # Store request data
+                    store_auto_request_data_location(commissary_requests, today, delivery_date, 'Commissary')
+                    
+                    # Send messages
+                    info_message = format_auto_request_info_message_location(commissary_requests, wd, today, 'Commissary')
+                    order_message = format_location_order_message(commissary_requests, wd, today, 'Commissary')
+                    
+                    tg_send_with_retry(CHAT_AUTOREQUEST, info_message)
+                    time_module.sleep(2)
+                    tg_send_with_retry(CHAT_AUTOREQUEST, order_message)
+                    messages_sent += 1
+                else:
+                    LOG.warning("Commissary: Too many items missing from recent counts")
+            
+            if messages_sent == 0:
+                alert_msg = f"<b>⚠️ AUTO-REQUEST SKIPPED</b>\nInsufficient recent on-hand data for both locations on {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][wd]}"
                 tg_send_with_retry(CHAT_AUTOREQUEST, alert_msg)
-                return
-            
-            # Calculate delivery date
-            delivery_date = next_delivery_after(today)
-            
-            # Generate requests for each location
-            avondale_requests = generate_location_requests('Avondale', wd, oh_map)
-            commissary_requests = generate_location_requests('Commissary', wd, oh_map)
-            
-            # Store request data for shortage tracking (flatten both locations)
-            all_requests = [(name, req_qty, on_hand, adu) for name, req_qty, on_hand, adu, _ in avondale_requests + commissary_requests]
-            store_auto_request_data(all_requests, today, delivery_date)
-            
-            # Send separate messages for each location
-            if avondale_requests:
-                avondale_info = format_auto_request_info_message(avondale_requests, wd, now.date())
-                avondale_order = format_auto_request_order_message(avondale_requests, wd, now.date())
-                tg_send_with_retry(CHAT_AUTOREQUEST, avondale_info)
-                time_module.sleep(1)
-                tg_send_with_retry(CHAT_AUTOREQUEST, avondale_order)
-                time_module.sleep(1)
-            
-            if commissary_requests:
-                commissary_info = format_auto_request_info_message(commissary_requests, wd, now.date())
-                commissary_order = format_auto_request_order_message(commissary_requests, wd, now.date())
-                tg_send_with_retry(CHAT_AUTOREQUEST, commissary_info)
-                time_module.sleep(1)
-                tg_send_with_retry(CHAT_AUTOREQUEST, commissary_order)
             
     except Exception as e:
         LOG.exception("Auto-request job failed: %s", e)
 
 def job_reassurance():
-    """Reassurance job with enhanced messaging."""
+    """FIXED: Reassurance job with location-aware messaging."""
     try:
         with get_db_connection() as conn:
             d = today_local()
@@ -1132,13 +1272,21 @@ def job_reassurance():
             avondale_status = get_item_status_for_date_location(conn, d, 'Avondale')
             commissary_status = get_item_status_for_date_location(conn, d, 'Commissary')
             
-            # Send reassurance for both locations
-            avondale_message = format_reassurance_message_location(avondale_status, d, 'Avondale')
-            commissary_message = format_reassurance_message_location(commissary_status, d, 'Commissary')
+            # Check if we have data for today for either location
+            avondale_data = sum(1 for item in avondale_status if item.qty is not None)
+            commissary_data = sum(1 for item in commissary_status if item.qty is not None)
             
-            tg_send_with_retry(CHAT_REASSURANCE, avondale_message)
-            time_module.sleep(1)  # Brief delay between messages
-            tg_send_with_retry(CHAT_REASSURANCE, commissary_message)
+            if avondale_data > 0:
+                avondale_message = format_reassurance_message_location(avondale_status, d, 'Avondale')
+                tg_send_with_retry(CHAT_REASSURANCE, avondale_message)
+                
+            if commissary_data > 0:
+                commissary_message = format_reassurance_message_location(commissary_status, d, 'Commissary')
+                tg_send_with_retry(CHAT_REASSURANCE, commissary_message)
+                
+            if avondale_data == 0 and commissary_data == 0:
+                no_data_msg = f"⚠️ <b>REASSURANCE ALERT</b>\nNo inventory data for either location today ({d.strftime('%a %b %d, %Y')})\n\nPlease ensure inventory counts are entered for accurate monitoring."
+                tg_send_with_retry(CHAT_REASSURANCE, no_data_msg)
             
     except Exception as e:
         LOG.exception("Reassurance job failed: %s", e)
@@ -1380,21 +1528,10 @@ def start_scheduler():
 # ========================== UI PAGES ==========================
 
 def page_entry():
-    """Mobile-optimized entry page with system health monitoring."""
+    """Mobile-optimized entry page with system health monitoring - FIXED form state management."""
     
-    # Clear form after successful submission (at beginning of function)
-    if st.session_state.get('form_submitted_successfully', False):
-        # Clear all item input keys
-        keys_to_clear = [key for key in st.session_state.keys() if key.startswith('item_')]
-        for key in keys_to_clear:
-            del st.session_state[key]
-        # Clear manager name and notes
-        if 'manager_name' in st.session_state:
-            del st.session_state['manager_name']
-        if 'entry_notes' in st.session_state:
-            del st.session_state['entry_notes']
-        # Clear the success flag
-        del st.session_state['form_submitted_successfully']
+    # REMOVED: The problematic form clearing logic that was at the beginning
+    # This was causing race conditions and interfering with validation display
     
     st.title("📱 K2 Inventory Entry")
     
@@ -1549,6 +1686,7 @@ def page_entry():
                             else:
                                 clean_inputs[item_name] = None
                         
+                        # FIXED: Use the backward compatibility function (defaults to Avondale)
                         created = handle_submit(entry_type, entry_date, name, notes, clean_inputs)
                     
                     if created > 0:
@@ -1569,11 +1707,14 @@ def page_entry():
                             st.write(", ".join(entered_items))
                             if notes.strip():
                                 st.write(f"**Notes:** {notes}")
-                                
-                        # Set flag for form clearing on next run (avoiding session state error)
-                        st.session_state['form_submitted_successfully'] = True
-                        st.info("🔄 Page will refresh to clear the form...")
-                        time_module.sleep(1)  # Brief pause for user to see confirmation
+                        
+                        # FIXED: Clear form state immediately after success
+                        for key in list(st.session_state.keys()):
+                            if key.startswith('item_') or key in ['manager_name', 'entry_notes']:
+                                del st.session_state[key]
+                        
+                        st.info("🔄 Form cleared - ready for next entry")
+                        time_module.sleep(2)  # Brief pause for user to see confirmation
                         st.rerun()
                     else:
                         st.error("❌ No entries were created - check logs")
@@ -2291,33 +2432,28 @@ if st.sidebar.button("🔍 Toggle Debug"):
 # Replace your existing Telegram command functions with these
 
 def start_telegram_command_handler():
-    """Telegram command handler with better connection management."""
+    """Enhanced Telegram command handler with interactive conversation support."""
     if not BOT_TOKEN:
         LOG.info("No Telegram bot token - command handler disabled")
         return
     
     def command_handler():
-        """Background thread for handling Telegram commands with exponential backoff."""
+        """Background thread for handling Telegram commands and conversations."""
         last_update_id = 0
-        consecutive_errors = 0
         
         while True:
             try:
-                # Dynamic timeout based on error count
-                timeout = min(30, 5 + consecutive_errors * 2)
-                
+                # Get updates from Telegram
                 response = requests.get(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
                     params={
                         'offset': last_update_id + 1,
-                        'timeout': timeout,
+                        'timeout': 10,
                         'allowed_updates': ['message']
-                    },
-                    timeout=timeout + 5,  # Slightly longer than Telegram timeout
+                    }
                 )
                 
                 if response.status_code == 200:
-                    consecutive_errors = 0  # Reset error counter on success
                     data = response.json()
                     
                     for update in data.get('result', []):
@@ -2328,37 +2464,29 @@ def start_telegram_command_handler():
                             chat_id = message['chat']['id']
                             text = message.get('text', '')
                             
+                            # Handle both commands and conversation responses
                             if text.startswith('/'):
+                                # It's a command
                                 command_parts = text.split(' ', 1)
                                 command = command_parts[0]
                                 full_message = text if len(command_parts) > 1 else command
+                                
                                 handle_telegram_command(chat_id, command, full_message)
                             else:
+                                # It's a conversation response
                                 handle_telegram_command(chat_id, text, text)
-                else:
-                    consecutive_errors += 1
-                    LOG.warning(f"Telegram API returned {response.status_code}")
                 
-            except requests.exceptions.Timeout:
-                # Timeout is normal with long polling, just continue
-                pass
-            except requests.exceptions.RequestException as e:
-                consecutive_errors += 1
-                wait_time = min(300, 30 * consecutive_errors)  # Max 5 min wait
-                LOG.error(f"Telegram connection error (will retry in {wait_time}s): {e}")
-                time_module.sleep(wait_time)
             except Exception as e:
-                consecutive_errors += 1
-                LOG.error(f"Telegram handler error: {e}")
-                time_module.sleep(60)
+                LOG.error(f"Telegram command handler error: {e}")
+                time_module.sleep(30)  # FIXED: Use time_module instead of time
             
-            # Small delay only if no timeout occurred
-            if consecutive_errors == 0:
-                time_module.sleep(0.1)
+            time_module.sleep(1)  # FIXED: Use time_module instead of time
     
+    # Start command handler in background thread
     thread = threading.Thread(target=command_handler, daemon=True)
     thread.start()
-    LOG.info("Telegram command handler started with improved connection management")
+    LOG.info("Enhanced Telegram command handler started with interactive conversation support")
+
 
 class ConversationState:
     """Manages conversation state for interactive data entry."""
@@ -3134,7 +3262,74 @@ def send_commands_list(chat_id: int):
 # ========================= TELEGRAM REPORTING FUNCTIONS ==========================
 
 def execute_auto_request_info(chat_id: int):
-    """Execute auto-request info with separate messages for both locations."""
+    """FIXED: Execute auto-request info with location-aware calculations."""
+    try:
+        now = now_local()
+        wd = now.weekday()
+        
+        if wd not in AVONDALE_REQUEST_WINDOWS and wd not in COMMISSARY_REQUEST_WINDOWS:
+            wd = 1  # Default to Tuesday
+        
+        command_header = f"🤖 COMMAND EXECUTED: /info\n📅 {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        with get_db_connection() as conn:
+            today = now.date()
+            
+            # Check for data availability per location
+            oh_map_avondale = map_oh_for_date_flexible_location(conn, today, 'Avondale')
+            oh_map_commissary = map_oh_for_date_flexible_location(conn, today, 'Commissary')
+            
+            avondale_data = sum(1 for name, (qty, _) in oh_map_avondale.items() if qty > 0)
+            commissary_data = sum(1 for name, (qty, _) in oh_map_commissary.items() if qty > 0)
+            
+            if avondale_data == 0 and commissary_data == 0:
+                no_data_msg = command_header + """⚠️ <b>No inventory data available</b>
+
+To generate auto-request analysis, you need recent inventory counts for at least one location.
+
+<b>Next steps:</b>
+1️⃣ Use /entry to add inventory counts  
+2️⃣ Or add counts via the web app
+3️⃣ Then try /info again
+
+<b>What this command does:</b>
+• Shows detailed request analysis
+• Calculates consumption needs by location  
+• Identifies items requiring orders
+• Provides coverage analysis"""
+                
+                tg_send_with_retry(chat_id, no_data_msg)
+                return
+            
+            # Generate location-specific requests
+            messages_sent = 0
+            
+            if avondale_data > 0:
+                avondale_requests = generate_location_requests('Avondale', wd, oh_map_avondale)
+                avondale_message = format_auto_request_info_message_location(avondale_requests, wd, today, 'Avondale')
+                full_message = command_header + avondale_message if messages_sent == 0 else avondale_message
+                tg_send_with_retry(chat_id, full_message)
+                messages_sent += 1
+                
+            if commissary_data > 0:
+                if messages_sent > 0:
+                    time_module.sleep(1)  # Brief delay between messages
+                
+                commissary_requests = generate_location_requests('Commissary', wd, oh_map_commissary)
+                commissary_message = format_auto_request_info_message_location(commissary_requests, wd, today, 'Commissary')
+                full_message = command_header + commissary_message if messages_sent == 0 else commissary_message
+                tg_send_with_retry(chat_id, full_message)
+                messages_sent += 1
+            
+            LOG.info(f"Auto-request info sent via command to {chat_id} ({messages_sent} messages)")
+            
+    except Exception as e:
+        LOG.error(f"Failed to execute auto-request info command: {e}")
+        error_msg = f"❌ <b>AUTO-REQUEST INFO FAILED</b>\n\nError: <code>{str(e)}</code>"
+        tg_send_with_retry(chat_id, error_msg)
+
+def execute_auto_request_order(chat_id: int):
+    """Execute auto-request order with separate messages for both locations."""
     try:
         now = now_local()
         wd = now.weekday()
@@ -3151,63 +3346,13 @@ def execute_auto_request_info(chat_id: int):
             commissary_data = sum(1 for name, (qty, _) in oh_map.items() if name in COMMISSARY_ITEMS and qty > 0)
             
             if avondale_data == 0 and commissary_data == 0:
-                no_data_msg = f"""📋 <b>REQUEST INFO</b>
-🤖 Command executed: /info
+                no_data_msg = f"""📋 <b>ORDER REQUEST</b>
+🤖 Command executed: /order
 📅 {now.strftime('%Y-%m-%d %H:%M:%S')}
 
 ⚠️ <b>No inventory data available</b>
 
-To generate request analysis, you need recent inventory counts for both locations.
-
-<b>Next steps:</b>
-1️⃣ Use /entry to add inventory counts
-2️⃣ Or add counts via the web app
-3️⃣ Then try /info again"""
-                
-                tg_send_with_retry(chat_id, no_data_msg)
-                return
-            
-            # Generate requests for each location
-            if avondale_data > 0:
-                avondale_requests = generate_location_requests('Avondale', wd, oh_map)
-                avondale_message = format_location_info_message(avondale_requests, wd, today, 'Avondale')
-                tg_send_with_retry(chat_id, avondale_message)
-                time_module.sleep(1)  # Brief delay between messages
-            
-            if commissary_data > 0:
-                commissary_requests = generate_location_requests('Commissary', wd, oh_map)
-                commissary_message = format_location_info_message(commissary_requests, wd, today, 'Commissary')
-                tg_send_with_retry(chat_id, commissary_message)
-            
-            LOG.info(f"Location-specific info messages sent via command to {chat_id}")
-            
-    except Exception as e:
-        LOG.error(f"Failed to execute auto-request info command: {e}")
-        error_msg = f"❌ <b>REQUEST INFO FAILED</b>\n\nError: <code>{str(e)}</code>"
-        tg_send_with_retry(chat_id, error_msg)
-
-def execute_auto_request_order(chat_id: int):
-    """Execute auto-request order with location-specific calculations."""
-    try:
-        now = now_local()
-        wd = now.weekday()
-        
-        command_header = f"🤖 COMMAND EXECUTED: /order\n📅 {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
-        with get_db_connection() as conn:
-            today = now.date()
-            
-            # Check data availability for both locations
-            oh_map_avondale = map_oh_for_date_flexible_location(conn, today, 'Avondale')
-            oh_map_commissary = map_oh_for_date_flexible_location(conn, today, 'Commissary')
-            
-            avondale_data = sum(1 for name, (qty, _) in oh_map_avondale.items() if qty > 0)
-            commissary_data = sum(1 for name, (qty, _) in oh_map_commissary.items() if qty > 0)
-            
-            if avondale_data == 0 and commissary_data == 0:
-                no_data_msg = command_header + """⚠️ <b>No inventory data available</b>
-
-To generate order requests, you need recent inventory counts for at least one location.
+To generate order requests, you need recent inventory counts for both locations.
 
 <b>Next steps:</b>
 1️⃣ Use /entry to add inventory counts
@@ -3217,41 +3362,17 @@ To generate order requests, you need recent inventory counts for at least one lo
                 tg_send_with_retry(chat_id, no_data_msg)
                 return
             
-            messages_sent = 0
-            
-            # Process Avondale if data available and scheduled
-            if avondale_data > 0 and wd in AVONDALE_REQUEST_WINDOWS:
-                avondale_requests = generate_location_requests('Avondale', wd, oh_map_avondale)
+            # Generate requests for each location
+            if avondale_data > 0:
+                avondale_requests = generate_location_requests('Avondale', wd, oh_map)
                 avondale_message = format_location_order_message(avondale_requests, wd, today, 'Avondale')
-                full_message = command_header + avondale_message if messages_sent == 0 else avondale_message
-                tg_send_with_retry(chat_id, full_message)
-                messages_sent += 1
-                time_module.sleep(1)
+                tg_send_with_retry(chat_id, avondale_message)
+                time_module.sleep(1)  # Brief delay between messages
             
-            # Process Commissary if data available and scheduled  
-            if commissary_data > 0 and wd in COMMISSARY_REQUEST_WINDOWS:
-                commissary_requests = generate_location_requests('Commissary', wd, oh_map_commissary)
+            if commissary_data > 0:
+                commissary_requests = generate_location_requests('Commissary', wd, oh_map)
                 commissary_message = format_location_order_message(commissary_requests, wd, today, 'Commissary')
-                full_message = command_header + commissary_message if messages_sent == 0 else commissary_message
-                tg_send_with_retry(chat_id, full_message)
-                messages_sent += 1
-            
-            # If no location was scheduled for today, show both anyway for manual use
-            if messages_sent == 0:
-                if avondale_data > 0:
-                    # Use default weekday for calculation
-                    default_wd = 1  # Tuesday
-                    avondale_requests = generate_location_requests('Avondale', default_wd, oh_map_avondale)
-                    avondale_message = format_location_order_message(avondale_requests, default_wd, today, 'Avondale')
-                    tg_send_with_retry(chat_id, command_header + avondale_message)
-                    time_module.sleep(1)
-                
-                if commissary_data > 0:
-                    # Use default weekday for Commissary calculation
-                    default_wd = 0  # Monday (for Tuesday delivery)
-                    commissary_requests = generate_location_requests('Commissary', default_wd, oh_map_commissary)
-                    commissary_message = format_location_order_message(commissary_requests, default_wd, today, 'Commissary')
-                    tg_send_with_retry(chat_id, commissary_message)
+                tg_send_with_retry(chat_id, commissary_message)
             
             LOG.info(f"Location-specific order messages sent via command to {chat_id}")
             
@@ -3261,9 +3382,16 @@ To generate order requests, you need recent inventory counts for at least one lo
         tg_send_with_retry(chat_id, error_msg)
 
 def generate_location_requests(location: str, run_weekday: int, oh_by_item: Dict[str, Tuple[float, str]]) -> List[Tuple[str, float, float, float, str]]:
-    """Generate requests for specific location."""
+    """FIXED: Generate requests for specific location with proper delivery windows."""
     items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
-    window = REQUEST_WINDOWS[run_weekday]
+    
+    # Use location-specific request windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
     total_days = window["total_days"] + DEFAULT_BUFFER_DAYS
     
     requests = []
@@ -3281,22 +3409,17 @@ def generate_location_requests(location: str, run_weekday: int, oh_by_item: Dict
     return requests
 
 def format_location_order_message(requests: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date, location: str) -> str:
-    """Format order message for specific location with correct delivery windows."""
-    # Use location-specific request windows
-    if location == 'Commissary':
-        windows = COMMISSARY_REQUEST_WINDOWS
-    else:
-        windows = AVONDALE_REQUEST_WINDOWS
+    """Format order message for specific location."""
+    window = REQUEST_WINDOWS[run_weekday]
+    team_name = f"{location} Prep Team"
     
-    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 2.5})
+    header = f"🤖 COMMAND EXECUTED: /order - {location.upper()}\n📅 {request_date.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    header += f"<b>📋 ORDER REQUEST - {location.upper()}</b>\n"
+    header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n\n"
+    header += f"Hey {team_name}! This is what we need for <b>{window['label']}</b>.\n"
+    header += f"Please confirm at your earliest convenience:\n"
     
-    header = f"<b>📋 ORDER REQUEST - {location.upper()}</b>\n"
-    header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n"
-    header += f"🚚 For: <b>{window['label']}</b>\n"
-    header += f"📊 Coverage: {window['total_days'] + DEFAULT_BUFFER_DAYS:.1f} days\n\n"
-    header += f"Hey {location} team! This is what we need:\n"
-    
-    # Only include items that need ordering
+    # Filter items that need ordering
     needed_items = [(name, req_qty, unit_type) for name, req_qty, _, _, unit_type in requests if req_qty > 0]
     
     if not needed_items:
@@ -3498,8 +3621,6 @@ An error occurred while checking for missing counts:
 2️⃣ Check system health in web app
 3️⃣ Contact support if problem persists"""
         tg_send_with_retry(chat_id, error_msg)
-
-
 
 # ========================== MAIN APPLICATION ==========================
 
