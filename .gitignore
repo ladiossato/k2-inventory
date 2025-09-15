@@ -9,6 +9,7 @@ venv/
 .venv/
 pip-log.txt
 pip-delete-this-directory.txt
+DEPLOYMENT_GUIDE.md
 
 # Database
 *.db

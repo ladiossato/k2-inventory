@@ -2431,32 +2431,48 @@ if st.sidebar.button("🔍 Toggle Debug"):
 # COMPLETE INTERACTIVE TELEGRAM DATA ENTRY SYSTEM
 # Replace your existing Telegram command functions with these
 
+# Global variable to track handler thread
+_telegram_handler_thread = None
+_telegram_handler_stop_event = None
+
 def start_telegram_command_handler():
-    """Enhanced Telegram command handler with interactive conversation support."""
+    """Enhanced Telegram command handler with proper thread management."""
+    global _telegram_handler_thread, _telegram_handler_stop_event
+    
     if not BOT_TOKEN:
         LOG.info("No Telegram bot token - command handler disabled")
         return
+    
+    # Stop existing handler if running
+    stop_telegram_command_handler()
+    
+    # Create stop event for clean shutdown
+    _telegram_handler_stop_event = threading.Event()
     
     def command_handler():
         """Background thread for handling Telegram commands and conversations."""
         last_update_id = 0
         
-        while True:
+        while not _telegram_handler_stop_event.is_set():
             try:
                 # Get updates from Telegram
                 response = requests.get(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
                     params={
                         'offset': last_update_id + 1,
-                        'timeout': 10,
+                        'timeout': 5,  # Reduced timeout for better responsiveness
                         'allowed_updates': ['message']
-                    }
+                    },
+                    timeout=10
                 )
                 
                 if response.status_code == 200:
                     data = response.json()
                     
                     for update in data.get('result', []):
+                        if _telegram_handler_stop_event.is_set():
+                            break
+                            
                         last_update_id = update['update_id']
                         
                         if 'message' in update:
@@ -2466,27 +2482,43 @@ def start_telegram_command_handler():
                             
                             # Handle both commands and conversation responses
                             if text.startswith('/'):
-                                # It's a command
                                 command_parts = text.split(' ', 1)
                                 command = command_parts[0]
                                 full_message = text if len(command_parts) > 1 else command
-                                
                                 handle_telegram_command(chat_id, command, full_message)
                             else:
-                                # It's a conversation response
                                 handle_telegram_command(chat_id, text, text)
                 
+            except requests.RequestException as e:
+                if not _telegram_handler_stop_event.is_set():
+                    LOG.error(f"Telegram request error: {e}")
+                    _telegram_handler_stop_event.wait(30)
             except Exception as e:
-                LOG.error(f"Telegram command handler error: {e}")
-                time_module.sleep(30)  # FIXED: Use time_module instead of time
+                if not _telegram_handler_stop_event.is_set():
+                    LOG.error(f"Telegram command handler error: {e}")
+                    _telegram_handler_stop_event.wait(30)
             
-            time_module.sleep(1)  # FIXED: Use time_module instead of time
+            if not _telegram_handler_stop_event.is_set():
+                _telegram_handler_stop_event.wait(1)
     
-    # Start command handler in background thread
-    thread = threading.Thread(target=command_handler, daemon=True)
-    thread.start()
-    LOG.info("Enhanced Telegram command handler started with interactive conversation support")
+    # Start new handler thread
+    _telegram_handler_thread = threading.Thread(target=command_handler, daemon=True)
+    _telegram_handler_thread.start()
+    LOG.info("Enhanced Telegram command handler started with proper thread management")
 
+def stop_telegram_command_handler():
+    """Stop the Telegram command handler thread."""
+    global _telegram_handler_thread, _telegram_handler_stop_event
+    
+    if _telegram_handler_stop_event:
+        _telegram_handler_stop_event.set()
+    
+    if _telegram_handler_thread and _telegram_handler_thread.is_alive():
+        _telegram_handler_thread.join(timeout=5)
+        LOG.info("Telegram command handler stopped")
+    
+    _telegram_handler_thread = None
+    _telegram_handler_stop_event = None
 
 class ConversationState:
     """Manages conversation state for interactive data entry."""
@@ -3410,16 +3442,20 @@ def generate_location_requests(location: str, run_weekday: int, oh_by_item: Dict
 
 def format_location_order_message(requests: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date, location: str) -> str:
     """Format order message for specific location."""
-    window = REQUEST_WINDOWS[run_weekday]
-    team_name = f"{location} Prep Team"
+    # Use location-specific request windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
     
-    header = f"🤖 COMMAND EXECUTED: /order - {location.upper()}\n📅 {request_date.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    header += f"<b>📋 ORDER REQUEST - {location.upper()}</b>\n"
+    header = f"<b>📋 ORDER REQUEST - {location.upper()}</b>\n"
     header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n\n"
-    header += f"Hey {team_name}! This is what we need for <b>{window['label']}</b>.\n"
+    header += f"Hey {location} team! This is what we need for <b>{window['label']}</b>.\n"
     header += f"Please confirm at your earliest convenience:\n"
     
-    # Filter items that need ordering
+    # Only include items that need ordering
     needed_items = [(name, req_qty, unit_type) for name, req_qty, _, _, unit_type in requests if req_qty > 0]
     
     if not needed_items:
@@ -3640,16 +3676,22 @@ def main():
             LOG.info("Scheduler started for local development")
         else:
             LOG.info("Scheduler disabled for production deployment")
-            # Start Telegram command handler instead
+            # Start Telegram command handler with proper thread management
             start_telegram_command_handler()
         
-        # FIXED: Call the correct function name
-        page_entry()  # Changed from ui_entry_form() to page_entry()
+        # Create tabs for the interface
+        tab1, tab2, tab3 = st.tabs(["📱 Entry", "📊 Analytics", "⚙️ Admin"])
+        
+        with tab1:
+            page_entry()
+        
+        with tab2:
+            page_analytics()
+        
+        with tab3:
+            page_admin()
         
     except Exception as e:
         LOG.exception("Application startup failed: %s", e)
         st.error(f"🚨 System startup failed: {str(e)}")
         st.stop()
-
-if __name__ == "__main__":
-    main()
