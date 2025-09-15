@@ -1,0 +1,28 @@
+[Unit]
+Description=K2 Inventory Management System
+After=network.target
+
+[Service]
+Type=simple
+User=k2inventory
+Group=k2inventory
+WorkingDirectory=/home/k2inventory/k2-inventory-app
+Environment=PATH=/home/k2inventory/k2-inventory-app/venv/bin
+ExecStart=/home/k2inventory/k2-inventory-app/venv/bin/streamlit run k2_inventory_app.py --server.address 0.0.0.0 --server.port 8501
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=k2-inventory
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/k2inventory/k2-inventory-app
+
+[Install]
+WantedBy=multi-user.target

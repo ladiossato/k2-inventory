@@ -1,0 +1,1275 @@
+# k2_inventory_app.py - FIXED VERSION
+# -------------------------------------------------------------
+# Enhanced Multi-Page Inventory Management System
+# - Container-based calculations (cases, quarts, trays, bags, bottles)
+# - Mobile-first responsive design
+# - FIXED form validation and consumption days display
+# - Entry Form, Analytics Dashboard, Admin Settings
+# - 3-month data retention with historical trends
+# - Two-message auto-request system
+# - COMPLETE LOCATION-AWARE FUNCTION FIXES
+#
+# Pages:
+# 1. Entry - Mobile-optimized data entry (On-Hand, Received only)
+# 2. Analytics - Historical trends and insights  
+# 3. Admin - Item management, system settings, test functions
+#
+# Run:
+#   pip install streamlit apscheduler requests python-dotenv plotly pandas
+#   streamlit run k2_inventory_app.py
+# -------------------------------------------------------------
+import json
+import os
+import math
+import sqlite3
+import threading
+import logging
+import time as time_module
+import pandas as pd
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+from typing import Dict, List, Optional, Tuple, NamedTuple, Any
+from dataclasses import dataclass
+
+import requests
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from dotenv import load_dotenv
+conversation_states: Dict[int, Dict[str, Any]] = {} # Global state for user conversations
+
+# Configure Streamlit for mobile-first design
+st.set_page_config(
+    page_title="K2 Inventory",
+    page_icon="🪣",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Mobile-first CSS injection
+st.markdown("""
+<style>
+    /* Mobile-first responsive design */
+    @media (max-width: 768px) {
+        .main .block-container {
+            padding-top: 1rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+        
+        .stButton > button {
+            width: 100%;
+            height: 3rem;
+            font-size: 1.1rem;
+        }
+        
+        .stTextInput > div > div > input {
+            font-size: 1.1rem;
+            height: 3rem;
+        }
+        
+        .stSelectbox > div > div > select {
+            font-size: 1.1rem;
+            height: 3rem;
+        }
+        
+        .stTextArea textarea {
+            font-size: 1.1rem;
+        }
+        
+        .stDateInput > div > div > input {
+            font-size: 1.1rem;
+            height: 3rem;
+        }
+    }
+    
+    /* Tab styling for mobile */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        padding: 12px 20px;
+        font-size: 1rem;
+        font-weight: 600;
+    }
+    
+    /* Status indicators */
+    .status-green { color: #00C851; font-weight: bold; }
+    .status-yellow { color: #FFB300; font-weight: bold; }
+    .status-red { color: #FF3547; font-weight: bold; }
+    .status-missing { color: #6C757D; font-weight: bold; }
+    
+    /* Metric cards */
+    .metric-card {
+        background: #F8F9FA;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #007BFF;
+        margin: 0.5rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ------------------------- Enhanced Logging -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(funcName)s | %(message)s",
+)
+LOG = logging.getLogger("k2")
+
+# ----------------------- Environment & Validation -----------------------
+load_dotenv()
+TZ = ZoneInfo(os.getenv("TZ", "America/Chicago"))
+
+def validate_environment():
+    """Validate required environment variables on startup."""
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not BOT_TOKEN:
+        LOG.warning("TELEGRAM_BOT_TOKEN not set - Telegram features disabled")
+        return ""
+    
+    # Validate chat IDs are integers
+    chat_vars = ["CHAT_ONHAND", "CHAT_AUTOREQUEST", "CHAT_RECEIVED", "CHAT_REASSURANCE"]
+    for var in chat_vars:
+        val = os.getenv(var)
+        if val and not val.lstrip('-').isdigit():
+            LOG.warning(f"{var} must be a valid integer chat ID")
+    
+    LOG.info("Environment validation completed")
+    return BOT_TOKEN
+
+BOT_TOKEN = validate_environment()
+
+# Toggle testing vs production
+USE_TEST_CHAT = True   # <-- flip this between True/False
+TEST_CHAT = 6904183057 # <-- your personal chat ID
+
+if USE_TEST_CHAT:
+    CHAT_ONHAND = CHAT_AUTOREQUEST = CHAT_RECEIVED = CHAT_REASSURANCE = TEST_CHAT
+    LOG.info("Using TEST_CHAT mode - all messages go to %s", TEST_CHAT)
+else:
+    CHAT_ONHAND = int(os.getenv("CHAT_ONHAND", "-1002819958218"))
+    CHAT_AUTOREQUEST = int(os.getenv("CHAT_AUTOREQUEST", "-1002819958218"))
+    CHAT_RECEIVED = int(os.getenv("CHAT_RECEIVED", "-4957164054"))
+    CHAT_REASSURANCE = int(os.getenv("CHAT_REASSURANCE", "6904183057"))
+
+# Business rules
+AVONDALE_DELIVERY_WEEKDAYS = {0, 3}  # Monday=0, Thursday=3
+COMMISSARY_DELIVERY_WEEKDAYS = {0, 2, 4}  # Monday=0, Wednesday=2, Friday=4
+
+DELIVERY_NOON = time(12, 0)
+
+AVONDALE_REQUEST_WINDOWS = {
+    1: {"label": "Thursday Delivery", "total_days": 6.5},  # Tuesday 08:00
+    5: {"label": "Monday Delivery", "total_days": 5.5},   # Saturday 08:00
+}
+
+COMMISSARY_REQUEST_WINDOWS = {
+    6: {"label": "Monday Delivery", "total_days": 2.5},    # Sunday 08:00
+    1: {"label": "Wednesday Delivery", "total_days": 2.5}, # Tuesday 08:00  
+    3: {"label": "Friday Delivery", "total_days": 2.5},    # Thursday 08:00
+}
+
+# Keep original for backward compatibility
+DELIVERY_WEEKDAYS = AVONDALE_DELIVERY_WEEKDAYS
+REQUEST_WINDOWS = AVONDALE_REQUEST_WINDOWS
+
+RUN_REASSURANCE = time(17, 0)
+RUN_MISSING = time(23, 59)
+RUN_REQ_HOUR = 8
+DEFAULT_BUFFER_DAYS = 1.0
+
+# Data retention policy
+DATA_RETENTION_DAYS = 90  # 3 months
+
+# Container-based items with ADU (containers per day) and unit types
+AVONDALE_ITEMS = {
+    "Steak": {"adu": 1.8, "unit_type": "case", "par_level": 6},
+    "Salmon": {"adu": 0.9, "unit_type": "case", "par_level": 3},
+    "Chipotle Aioli": {"adu": 8.0, "unit_type": "quart", "par_level": 24},
+    "Garlic Aioli": {"adu": 6.0, "unit_type": "quart", "par_level": 18},
+    "Jalapeno Aioli": {"adu": 5.0, "unit_type": "quart", "par_level": 15},
+    "Sriracha Aioli": {"adu": 2.0, "unit_type": "quart", "par_level": 6},
+    "Ponzu Sauce": {"adu": 3.0, "unit_type": "quart", "par_level": 9},
+    "Teriyaki/Soyu Sauce": {"adu": 3.0, "unit_type": "quart", "par_level": 9},
+    "Orange Sauce": {"adu": 4.0, "unit_type": "quart", "par_level": 12},
+    "Bulgogi Sauce": {"adu": 3.0, "unit_type": "quart", "par_level": 9},
+    "Fried Rice Sauce": {"adu": 4.0, "unit_type": "quart", "par_level": 12},
+    "Honey": {"adu": 2.0, "unit_type": "bottle", "par_level": 6},
+}
+
+COMMISSARY_ITEMS = {
+    "Fish": {"adu": 0.3, "unit_type": "tray", "par_level": 1},
+    "Shrimp": {"adu": 0.5, "unit_type": "tray", "par_level": 2},
+    "Grilled Chicken": {"adu": 2.5, "unit_type": "case", "par_level": 8},
+    "Crispy Chicken": {"adu": 3.5, "unit_type": "case", "par_level": 11},
+    "Crab Ragoon": {"adu": 1.9, "unit_type": "bag", "par_level": 6},
+    "Nutella Ragoon": {"adu": 0.7, "unit_type": "bag", "par_level": 3},
+    "Ponzu Cups": {"adu": 0.8, "unit_type": "quart", "par_level": 3},
+}
+
+# Combine for backward compatibility
+ITEMS_CONFIG = {**AVONDALE_ITEMS, **COMMISSARY_ITEMS}
+
+# Unit type mappings for display
+UNIT_TYPES = {
+    "case": "cases",
+    "quart": "quarts", 
+    "tray": "trays",
+    "bag": "bags",
+    "bottle": "bottles",
+    "container": "containers"
+}
+
+# ----------------------- Enhanced Data Types -----------------------
+@dataclass
+class ItemStatus:
+    name: str
+    qty: Optional[float]
+    status: str  # Green, Yellow, Red, Missing
+    consumption_need: float
+    par_gap: float
+    par_level: float
+    adu: float
+    unit_type: str
+    days_to_delivery: float
+    days_coverage: float  # How many days current stock will last
+
+@dataclass
+class MessageStyle:
+    """Consistent styling for Telegram messages."""
+    HEADER = "🪣"
+    SUCCESS = "✅"
+    WARNING = "⚠️"
+    CRITICAL = "🚨"
+    INFO = "ℹ️"
+    GREEN = "🟢"
+    YELLOW = "🟡"
+    RED = "🔴"
+    MISSING = "❌"
+
+# ------------------------- Enhanced Database -------------------------
+DB_PATH = os.path.join(os.path.dirname(__file__), "k2.db")
+
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    adu REAL NOT NULL,
+    unit_type TEXT NOT NULL DEFAULT 'case',
+    buffer_days REAL NOT NULL DEFAULT 1.0,
+    par_level REAL NOT NULL,
+    active BOOLEAN DEFAULT TRUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nightly_on_hand (
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    d TEXT NOT NULL,
+    qty REAL,
+    manager TEXT,
+    notes TEXT,
+    location TEXT DEFAULT 'Avondale',
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_onhand_unique ON nightly_on_hand(item_id, d, location);
+CREATE INDEX IF NOT EXISTS idx_onhand_date ON nightly_on_hand(d);
+
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    d TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('Received')),
+    received_qty REAL,
+    notes TEXT,
+    location TEXT DEFAULT 'Avondale',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_item_date ON transfers(item_id, d);
+CREATE INDEX IF NOT EXISTS idx_transfers_date ON transfers(d);
+
+CREATE TABLE IF NOT EXISTS auto_requests (
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    request_date TEXT NOT NULL,
+    delivery_date TEXT NOT NULL,
+    requested_qty REAL NOT NULL,
+    on_hand_qty REAL NOT NULL,
+    location TEXT DEFAULT 'Avondale',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auto_requests_date ON auto_requests(request_date);
+CREATE INDEX IF NOT EXISTS idx_auto_requests_delivery ON auto_requests(delivery_date);
+
+CREATE TABLE IF NOT EXISTS system_log (
+    id INTEGER PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_system_log_date ON system_log(created_at);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
+
+def get_db_connection() -> sqlite3.Connection:
+    """Get a new database connection for each operation."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """FIXED: Initialize database with proper location migration."""
+    try:
+        with get_db_connection() as conn:
+            conn.executescript(SCHEMA_SQL)
+            
+            # FIXED: Check if location columns exist and populate defaults
+            cursor = conn.execute("PRAGMA table_info(nightly_on_hand)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'location' not in columns:
+                LOG.info("Adding location support to database schema...")
+                conn.execute("ALTER TABLE nightly_on_hand ADD COLUMN location TEXT DEFAULT 'Avondale'")
+                conn.execute("ALTER TABLE transfers ADD COLUMN location TEXT DEFAULT 'Avondale'")
+                conn.execute("ALTER TABLE auto_requests ADD COLUMN location TEXT DEFAULT 'Avondale'")
+                conn.commit()
+                LOG.info("Location schema migration completed")
+            else:
+                # Ensure existing records have location values
+                conn.execute("UPDATE nightly_on_hand SET location = 'Avondale' WHERE location IS NULL")
+                conn.execute("UPDATE transfers SET location = 'Avondale' WHERE location IS NULL")
+                conn.execute("UPDATE auto_requests SET location = 'Avondale' WHERE location IS NULL")
+                conn.commit()
+            
+            # Check if we need to migrate from old schema (case_size to unit_type)
+            try:
+                conn.execute("SELECT unit_type FROM items LIMIT 1")
+            except sqlite3.OperationalError:
+                LOG.info("Migrating database schema to container-based system...")
+                # Add unit_type column if it doesn't exist
+                conn.execute("ALTER TABLE items ADD COLUMN unit_type TEXT DEFAULT 'case'")
+                # Drop case_size column if it exists
+                try:
+                    conn.execute("ALTER TABLE items DROP COLUMN case_size")
+                except:
+                    pass
+                conn.commit()
+            
+            # Seed items if empty or update existing items
+            cur = conn.execute("SELECT COUNT(*) AS n FROM items")
+            if cur.fetchone()["n"] == 0:
+                LOG.info("Seeding items table with container-based configuration...")
+                ts = datetime.now(TZ).isoformat()
+                for name, config in ITEMS_CONFIG.items():
+                    conn.execute(
+                        "INSERT INTO items(name, adu, unit_type, buffer_days, par_level, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                        (name, config["adu"], config["unit_type"], DEFAULT_BUFFER_DAYS, config["par_level"], ts, ts),
+                    )
+                conn.commit()
+                LOG.info("Database initialized with container-based system")
+            else:
+                # Update existing items with new configuration
+                LOG.info("Updating existing items with container-based configuration...")
+                ts = datetime.now(TZ).isoformat()
+                for name, config in ITEMS_CONFIG.items():
+                    conn.execute(
+                        "UPDATE items SET adu=?, unit_type=?, par_level=?, updated_at=? WHERE name=?",
+                        (config["adu"], config["unit_type"], config["par_level"], ts, name)
+                    )
+                conn.commit()
+                LOG.info("Items updated to container-based system")
+                
+    except Exception as e:
+        LOG.error("Database initialization failed: %s", e)
+        raise
+
+def cleanup_old_data():
+    """Clean up data older than retention period."""
+    try:
+        cutoff_date = (datetime.now(TZ) - timedelta(days=DATA_RETENTION_DAYS)).date()
+        with get_db_connection() as conn:
+            # Clean old on-hand records
+            result1 = conn.execute("DELETE FROM nightly_on_hand WHERE d < ?", (cutoff_date.isoformat(),))
+            # Clean old transfers
+            result2 = conn.execute("DELETE FROM transfers WHERE d < ?", (cutoff_date.isoformat(),))
+            # Clean old auto-requests
+            result3 = conn.execute("DELETE FROM auto_requests WHERE request_date < ?", (cutoff_date.isoformat(),))
+            # Clean old system logs
+            result4 = conn.execute("DELETE FROM system_log WHERE date(created_at) < ?", (cutoff_date.isoformat(),))
+            conn.commit()
+            
+            total_cleaned = result1.rowcount + result2.rowcount + result3.rowcount + result4.rowcount
+            if total_cleaned > 0:
+                LOG.info(f"Cleaned up {total_cleaned} old records (older than {cutoff_date})")
+                
+    except Exception as e:
+        LOG.error("Data cleanup failed: %s", e)
+
+def check_system_health():
+    """Complete system health check for deployment monitoring."""
+    health_status = {
+        'database': False,
+        'telegram': False,
+        'items_configured': False,
+        'overall': False
+    }
+    
+    try:
+        # Test database connection
+        with get_db_connection() as conn:
+            conn.execute("SELECT 1").fetchone()
+            health_status['database'] = True
+            
+            # Check if items are properly configured
+            item_count = conn.execute("SELECT COUNT(*) as count FROM items").fetchone()['count']
+            if item_count > 0:
+                health_status['items_configured'] = True
+    except Exception as e:
+        LOG.error(f"Database health check failed: {e}")
+    
+    try:
+        # Test Telegram connection (if token available)
+        if BOT_TOKEN:
+            test_msg = f"🔥 Health check from K2 Inventory\n📅 {now_local().strftime('%Y-%m-%d %H:%M:%S')}"
+            # Don't actually send, just validate token format
+            if len(BOT_TOKEN.split(':')) == 2:
+                health_status['telegram'] = True
+    except Exception as e:
+        LOG.error(f"Telegram health check failed: {e}")
+    
+    # Overall health
+    health_status['overall'] = all([
+        health_status['database'],
+        health_status['telegram'],
+        health_status['items_configured']
+    ])
+    
+    return health_status
+
+
+# ---------------------- Time Helpers -----------------------
+def today_local() -> date:
+    return datetime.now(TZ).date()
+
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+def next_delivery_after_location(d: date, location: str) -> date:
+    """Return next delivery date based on location."""
+    delivery_weekdays = COMMISSARY_DELIVERY_WEEKDAYS if location == 'Commissary' else AVONDALE_DELIVERY_WEEKDAYS
+    
+    for i in range(1, 8):
+        cand = d + timedelta(days=i)
+        if cand.weekday() in delivery_weekdays:
+            return cand
+    return d + timedelta(days=1)  # fallback
+
+def next_delivery_after(d: date) -> date:
+    """Backward compatibility - defaults to Avondale schedule"""
+    return next_delivery_after_location(d, 'Avondale')
+
+def next_two_deliveries_from(d: date) -> Tuple[date, date]:
+    first = next_delivery_after(d)
+    second = next_delivery_after(first)
+    return first, second
+
+def days_until_delivery_location(count_date: date, location: str) -> float:
+    """Calculate days until delivery for specific location."""
+    next_del = next_delivery_after_location(count_date, location)
+    start = datetime.combine(count_date + timedelta(days=1), time(0, 0), TZ)
+    end = datetime.combine(next_del, DELIVERY_NOON, TZ)
+    delta = end - start
+    days = max(0.0, delta.total_seconds() / 86400.0)
+    LOG.debug(f"Days until delivery from {count_date} to {next_del}: {days:.2f} days")
+    return days
+
+def days_until_delivery(count_date: date) -> float:
+    """Backward compatibility - defaults to Avondale schedule"""
+    return days_until_delivery_location(count_date, 'Avondale')
+
+# ------------------- Fixed Container-Based Calculations ----------------
+
+def calculate_item_status_location(name: str, qty: Optional[float], count_date: date, adu: float, par_level: float, unit_type: str, location: str) -> ItemStatus:
+    """Calculate item status with location-specific delivery schedule."""
+    days_to_delivery = days_until_delivery_location(count_date, location)
+    
+    # Consumption need based on location delivery schedule
+    consumption_need = adu * (days_to_delivery + DEFAULT_BUFFER_DAYS)
+    
+    # Days coverage
+    days_coverage = (qty / adu) if qty and adu > 0 else 0.0
+    
+    # Par gap (still calculated but not displayed)
+    par_gap = max(0.0, par_level - (qty or 0.0))
+    
+    if qty is None:
+        return ItemStatus(name, None, "Missing", consumption_need, par_gap, par_level, adu, unit_type, days_to_delivery, 0.0)
+    
+    # Status logic based on consumption need, not par
+    if qty < consumption_need:
+        status = "Red"
+    elif qty < par_level:  # Still using par for yellow threshold
+        status = "Yellow"
+    else:
+        status = "Green"
+    
+    return ItemStatus(name, qty, status, consumption_need, par_gap, par_level, adu, unit_type, days_to_delivery, days_coverage)
+
+def calculate_item_status(name: str, qty: Optional[float], count_date: date, adu: float, par_level: float, unit_type: str) -> ItemStatus:
+    """Backward compatibility - defaults to Avondale location"""
+    return calculate_item_status_location(name, qty, count_date, adu, par_level, unit_type, 'Avondale')
+
+# ------------------- Enhanced Telegram Messaging -------------------
+def tg_send_with_retry(chat_id: int, text: str, max_retries: int = 3) -> bool:
+    """Send Telegram message with retry logic."""
+    if not BOT_TOKEN:
+        LOG.info("Telegram disabled - would send: %s", text[:100])
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id, 
+                    "text": text,
+                    "parse_mode": "HTML"
+                },
+                timeout=10,
+            )
+            
+            if resp.status_code == 200:
+                LOG.info("Telegram sent to %s (%d chars)", chat_id, len(text))
+                return True
+            else:
+                LOG.warning("Telegram error %s (attempt %d): %s", resp.status_code, attempt + 1, resp.text[:200])
+                
+        except Exception as e:
+            LOG.warning("Telegram send failed (attempt %d): %s", attempt + 1, e)
+        
+        if attempt < max_retries - 1:
+            wait_time = (2 ** attempt) * 1
+            time_module.sleep(wait_time)
+    
+    LOG.error("Failed to send Telegram after %d attempts", max_retries)
+    return False
+
+def format_unit_display(qty: float, unit_type: str) -> str:
+    """Format quantity with proper unit display - no unnecessary decimals."""
+    unit_name = UNIT_TYPES.get(unit_type, unit_type)
+    
+    # FIXED: Display whole numbers without decimals
+    if qty == int(qty):
+        qty_str = str(int(qty))
+    else:
+        qty_str = f"{qty:g}"
+    
+    if qty == 1.0:
+        # Use singular form
+        unit_name = unit_name.rstrip('s')
+    
+    return f"{qty_str} {unit_name}"
+
+def format_on_hand_message_with_location(items_status: List[ItemStatus], entry_date: date, manager_name: str, location: str) -> str:
+    """FIXED format with consumption need instead of par references."""
+    style = MessageStyle()
+    
+    reds = [item for item in items_status if item.status == "Red"]
+    yellows = [item for item in items_status if item.status == "Yellow"]
+    greens = [item for item in items_status if item.status == "Green"]
+    missing = [item for item in items_status if item.status == "Missing"]
+    
+    next_delivery = next_delivery_after_location(entry_date, location)
+    delivery_day = next_delivery.strftime('%a %b %d')
+    
+    header = f"<b>{style.HEADER} INVENTORY COUNT - {location.upper()}</b>\n"
+    header += f"📅 {entry_date.strftime('%a %b %d, %Y')}\n"
+    header += f"🚚 Next Delivery: {delivery_day}\n"
+    if manager_name.strip():
+        header += f"👤 Submitted by: <b>{manager_name}</b>\n"
+    
+    summary = f"📊 <b>Status:</b> {len(greens)}✅ {len(yellows)}🟡 {len(reds)}🔴"
+    if missing:
+        summary += f" {len(missing)}❌"
+    
+    lines = [header, summary, ""]
+    
+    # Critical items
+    if reds:
+        lines.append(f"<b>{style.CRITICAL} URGENT - WON'T LAST TO DELIVERY</b>")
+        for item in reds:
+            qty_display = format_unit_display(item.qty or 0, item.unit_type)
+            shortage = max(0.0, item.consumption_need - (item.qty or 0.0))
+            shortage_rounded = math.ceil(shortage)
+            
+            lines.append(f"{style.RED} <b>{item.name}</b>: {qty_display}")
+            lines.append(f"   Need <b>{shortage_rounded} more</b> to reach delivery")
+        lines.append("")
+    
+    # Warning items - show consumption need instead of "below par"
+    if yellows:
+        lines.append(f"<b>{style.WARNING} CAUTION - WON'T REACH FULL CYCLE</b>")
+        for item in yellows:
+            qty_display = format_unit_display(item.qty or 0, item.unit_type)
+            coverage_days_rounded = math.ceil(item.days_coverage)
+            # Calculate how much more needed for full cycle
+            shortage_for_cycle = max(0.0, item.consumption_need - (item.qty or 0.0))
+            shortage_rounded = math.ceil(shortage_for_cycle)
+            
+            lines.append(f"{style.YELLOW} <b>{item.name}</b>: {qty_display}")
+            lines.append(f"   Need <b>{shortage_rounded} more</b> for full cycle ({coverage_days_rounded} days coverage)")
+        lines.append("")
+    
+    # Missing counts
+    if missing:
+        lines.append(f"<b>{style.CRITICAL} MISSING COUNTS</b>")
+        for item in missing:
+            lines.append(f"{style.MISSING} <b>{item.name}</b> - No count entered")
+        lines.append("")
+    
+    # Fully stocked
+    if greens:
+        lines.append(f"<b>{style.SUCCESS} FULLY STOCKED</b>")
+        for item in greens:
+            qty_display = format_unit_display(item.qty, item.unit_type)
+            lines.append(f"{style.GREEN} <b>{item.name}</b>: {qty_display}")
+    
+    return "\n".join(lines)
+
+def format_received_message_with_location(items_received: List[Tuple[str, float]], entry_date: date, notes: str, manager_name: str, location: str) -> str:
+    """Format received message with location identification."""
+    style = MessageStyle()
+    
+    header = f"<b>📦 DELIVERY RECEIVED - {location.upper()}</b>\n📅 {entry_date.strftime('%a %b %d, %Y')}\n"
+    if manager_name.strip():
+        header += f"👤 Received by: <b>{manager_name}</b>\n"
+    
+    lines = [header, f"\n<b>✅ ITEMS RECEIVED ({len(items_received)} items):</b>"]
+    
+    # Get items config for location to determine unit types
+    items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
+    
+    for name, received_qty in items_received:
+        if name in items_config:
+            unit_type = items_config[name]["unit_type"]
+            received_display = format_unit_display(received_qty, unit_type)
+            lines.append(f"• <b>{name}</b>: +{received_display}")
+    
+    if notes.strip():
+        lines.append(f"\n📝 <b>Notes:</b> {notes}")
+    
+    return "\n".join(lines)
+
+def format_received_message_with_shortages(items_received: List[Tuple[str, float]], entry_date: date, notes: str = "", manager_name: str = "") -> str:
+    """Enhanced received message with shortage tracking and name accountability - COMPLETE VERSION."""
+    style = MessageStyle()
+    
+    header = f"<b>📦 DELIVERY RECEIVED</b>\n📅 {entry_date.strftime('%a %b %d, %Y')}\n"
+    if manager_name.strip():
+        header += f"👤 Received by: <b>{manager_name}</b>\n"
+    
+    # Get most recent auto-request data for shortage comparison - COMPLETE LOGIC
+    shortage_data = {}
+    try:
+        with get_db_connection() as conn:
+            # Look for auto-requests from the last 7 days that could apply to this delivery
+            lookback_date = (entry_date - timedelta(days=7)).isoformat()
+            cur = conn.execute("""
+                SELECT i.name, ar.requested_qty, ar.request_date, i.unit_type
+                FROM auto_requests ar
+                JOIN items i ON ar.item_id = i.id
+                WHERE ar.request_date >= ? AND ar.delivery_date >= ?
+                ORDER BY ar.request_date DESC
+            """, (lookback_date, entry_date.isoformat()))
+            
+            for row in cur.fetchall():
+                name = row["name"]
+                if name not in shortage_data:  # Take most recent request
+                    shortage_data[name] = {
+                        "requested": float(row["requested_qty"]),
+                        "unit_type": row["unit_type"],
+                        "date": row["request_date"]
+                    }
+    except Exception as e:
+        LOG.error("Failed to load shortage data: %s", e)
+    
+    lines = [header, f"\n<b>✅ ITEMS RECEIVED ({len(items_received)} items):</b>"]
+    
+    # Process each received item for shortage detection - COMPLETE LOGIC
+    has_shortages = False
+    for name, received_qty in items_received:
+        # Get unit type for this item
+        try:
+            with get_db_connection() as conn:
+                unit_row = conn.execute("SELECT unit_type FROM items WHERE name = ?", (name,)).fetchone()
+                unit_type = unit_row["unit_type"] if unit_row else "case"
+        except:
+            unit_type = "case"
+        
+        received_display = format_unit_display(received_qty, unit_type)
+        
+        if name in shortage_data:
+            requested_qty = shortage_data[name]["requested"]
+            shortage = requested_qty - received_qty
+            
+            if shortage > 0.1:  # Small tolerance for rounding
+                has_shortages = True
+                requested_display = format_unit_display(requested_qty, unit_type)
+                shortage_display = format_unit_display(shortage, unit_type)
+                lines.append(f"• <b>{name}</b>: +{received_display} <b>(SHORTED: requested {requested_display}, short {shortage_display})</b> ⚠️")
+            else:
+                lines.append(f"• <b>{name}</b>: +{received_display} ✅")
+        else:
+            # No recent request found - just show received
+            lines.append(f"• <b>{name}</b>: +{received_display}")
+    
+    # Shortage summary - COMPLETE LOGIC
+    if has_shortages:
+        lines.append(f"\n⚠️ <b>SHORTAGES DETECTED</b> - Review with supplier")
+    
+    # Notes section - COMPLETE LOGIC
+    if notes.strip():
+        lines.append(f"\n📝 <b>Notes:</b> {notes}")
+    
+    return "\n".join(lines)
+
+def format_auto_request_info_message_location(request_data: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date, location: str) -> str:
+    """Location-aware detailed information message for managers."""
+    style = MessageStyle()
+    
+    # Use location-specific request windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
+    
+    header = f"<b>🪣 AUTO-REQUEST ANALYSIS - {location.upper()}</b>\n"
+    header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n"
+    header += f"🚚 For: <b>{window['label']}</b>\n"
+    header += f"📊 Coverage: {window['total_days'] + DEFAULT_BUFFER_DAYS:.1f} days\n"
+    header += f"📋 Based on most recent inventory count\n"
+    
+    lines = [header, f"\n<b>📊 DETAILED ANALYSIS:</b>"]
+    
+    for name, req_qty, on_hand, adu, unit_type in request_data:
+        current_display = format_unit_display(on_hand, unit_type)
+        
+        if req_qty > 0:
+            coverage_days = on_hand / adu if adu > 0 else 0
+            need_display = format_unit_display(req_qty, unit_type)
+            lines.append(f"\n<b>{name}</b>:")
+            lines.append(f"  Current: {current_display} ({coverage_days:.1f} days)")
+            lines.append(f"  Daily use: {adu:g} • Need: <b>{need_display}</b>")
+        else:
+            lines.append(f"\n<b>{name}</b>: Fully stocked ({current_display})")
+    
+    return "\n".join(lines)
+
+def format_auto_request_info_message(request_data: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date) -> str:
+    """Backward compatibility - defaults to Avondale"""
+    return format_auto_request_info_message_location(request_data, run_weekday, request_date, 'Avondale')
+
+def format_location_order_message(requests: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date, location: str) -> str:
+    """Format order message for specific location."""
+    # Use location-specific windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
+    team_name = f"{location} Prep Team"
+    
+    header = f"<b>📋 ORDER REQUEST - {location.upper()}</b>\n"
+    header += f"📅 {request_date.strftime('%a %b %d, %Y')}\n\n"
+    header += f"Hey {team_name}! This is what we need for <b>{window['label']}</b>.\n"
+    header += f"Please confirm at your earliest convenience:\n"
+    
+    # Filter items that need ordering
+    needed_items = [(name, req_qty, unit_type) for name, req_qty, _, _, unit_type in requests if req_qty > 0]
+    
+    if not needed_items:
+        return header + f"\n✅ <b>NO ORDERS NEEDED</b>\nAll {location} items are fully stocked!"
+    
+    lines = [header]
+    for name, req_qty, unit_type in needed_items:
+        qty_display = format_unit_display(req_qty, unit_type)
+        lines.append(f"• <b>{name}</b>: {qty_display}")
+    
+    lines.append(f"\nTotal items: <b>{len(needed_items)}</b>")
+    
+    return "\n".join(lines)
+
+def format_auto_request_order_message(request_data: List[Tuple[str, float, float, float, str]], run_weekday: int, request_date: date) -> str:
+    """Backward compatibility - defaults to Avondale"""
+    return format_location_order_message(request_data, run_weekday, request_date, 'Avondale')
+
+def format_reassurance_message_location(items_status: List[ItemStatus], check_date: date, location: str) -> str:
+    """Format reassurance message for specific location."""
+    style = MessageStyle()
+    
+    reds = [item for item in items_status if item.status == "Red"]
+    yellows = [item for item in items_status if item.status == "Yellow"]
+    missing = [item for item in items_status if item.status == "Missing"]
+    
+    header = f"<b>{style.INFO} DAILY REASSURANCE - {location.upper()}</b>\n"
+    header += f"📅 {check_date.strftime('%a %b %d, %Y')} • 5:00 PM\n"
+    
+    if not reds and not yellows and not missing:
+        return header + f"\n{style.SUCCESS} <b>ALL SYSTEMS GREEN</b>\nAll {location} inventory levels are adequate ✅"
+    
+    lines = [header]
+    
+    if reds:
+        lines.append(f"\n{style.CRITICAL} <b>CRITICAL ITEMS:</b>")
+        for item in reds:
+            qty_display = format_unit_display(item.qty or 0, item.unit_type)
+            # Calculate remaining need for delivery
+            remaining_need = max(0.0, item.consumption_need - (item.qty or 0.0))
+            remaining_need_rounded = math.ceil(remaining_need)
+            remaining_display = format_unit_display(remaining_need_rounded, item.unit_type)
+            lines.append(f"• <b>{item.name}</b> - Only {qty_display} left (Need {remaining_display} more)")
+    
+    if yellows:
+        lines.append(f"\n{style.WARNING} <b>WATCH LIST:</b>")
+        for item in yellows:
+            qty_display = format_unit_display(item.qty or 0, item.unit_type)
+            coverage_days_rounded = math.ceil(item.days_coverage)
+            lines.append(f"• <b>{item.name}</b> - {qty_display} ({coverage_days_rounded} days coverage)")
+    
+    if missing:
+        lines.append(f"\n{style.MISSING} <b>MISSING COUNTS:</b>")
+        lines.append("• " + ", ".join(item.name for item in missing))
+    
+    return "\n".join(lines)
+
+def format_reassurance_message(items_status: List[ItemStatus], check_date: date) -> str:
+    """Backward compatibility - defaults to Avondale location"""
+    return format_reassurance_message_location(items_status, check_date, 'Avondale')
+
+# ------------------- Enhanced Data Lookup Functions -------------------
+def map_oh_for_date_flexible(conn: sqlite3.Connection, target_date: date) -> Dict[str, Tuple[float, str]]:
+    """Return most recent On-Hand qty and unit_type per item on or before target_date."""
+    out: Dict[str, Tuple[float, str]] = {}
+    
+    # Get all active items first
+    items = conn.execute("SELECT name, unit_type FROM items WHERE active = TRUE").fetchall()
+    
+    for item in items:
+        name = item["name"]
+        unit_type = item["unit_type"]
+        
+        # Look for most recent on-hand data on or before target_date
+        recent = conn.execute("""
+            SELECT qty FROM nightly_on_hand oh
+            JOIN items i ON oh.item_id = i.id
+            WHERE i.name = ? AND oh.d <= ?
+            ORDER BY oh.d DESC, oh.created_at DESC
+            LIMIT 1
+        """, (name, target_date.isoformat())).fetchone()
+        
+        if recent and recent["qty"] is not None:
+            qty = float(recent["qty"])
+        else:
+            qty = 0.0
+            
+        out[name] = (qty, unit_type)
+    
+    return out
+
+# ----------------------- Submit Handlers -----------------------
+def upsert_item_id(conn: sqlite3.Connection, name: str) -> int:
+    """Get or create item ID."""
+    cur = conn.execute("SELECT id FROM items WHERE name=?", (name,))
+    row = cur.fetchone()
+    if row:
+        return row["id"]
+    
+    # Create missing item with default values
+    ts = now_local().isoformat()
+    conn.execute(
+        "INSERT INTO items(name, adu, unit_type, buffer_days, par_level, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (name, 1.0, "case", DEFAULT_BUFFER_DAYS, 3.0, ts, ts),
+    )
+    return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+def handle_submit_with_location(entry_type: str, entry_date: date, manager: str, notes: str, qty_inputs: Dict[str, Optional[float]], location: str) -> int:
+    """Submit handler with location support."""
+    created = 0
+    ts = now_local().isoformat()
+    
+    LOG.info(f"=== SUBMIT HANDLER START - {location} ===")
+    LOG.info(f"Entry type: {entry_type}, Location: {location}, Manager: {manager}")
+    
+    # Get items config for this location
+    items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
+    
+    # Clean validation for partial submissions
+    valid_entries = {}
+    for item_name, qty in qty_inputs.items():
+        if item_name not in items_config:
+            continue  # Skip items not relevant to this location
+        if qty is None:
+            continue
+        try:
+            float_qty = float(qty)
+            if float_qty > 0:
+                valid_entries[item_name] = float_qty
+        except (ValueError, TypeError):
+            continue
+    
+    if not valid_entries:
+        return 0
+    
+    try:
+        with get_db_connection() as conn:
+            if entry_type == "On-Hand":
+                items_status = []
+                
+                for item_name, qty in valid_entries.items():
+                    item_id = upsert_item_id(conn, item_name)
+                    
+                    config = items_config[item_name]
+                    adu = config["adu"]
+                    par_level = config["par_level"]
+                    unit_type = config["unit_type"]
+                    
+                    # Insert with location
+                    conn.execute(
+                        "INSERT OR REPLACE INTO nightly_on_hand(item_id, d, qty, manager, notes, location, created_at) VALUES (?,?,?,?,?,?,?)",
+                        (item_id, entry_date.isoformat(), qty, manager, notes, location, ts),
+                    )
+                    created += 1
+                    
+                    # FIXED: Use location-aware status calculation
+                    status = calculate_item_status_location(item_name, qty, entry_date, adu, par_level, unit_type, location)
+                    items_status.append(status)
+                
+                conn.commit()
+                
+                if items_status:
+                    message = format_on_hand_message_with_location(items_status, entry_date, manager, location)
+                    success = tg_send_with_retry(CHAT_ONHAND, message)
+                    
+            elif entry_type == "Received":
+                items_received = []
+                
+                for item_name, qty in valid_entries.items():
+                    item_id = upsert_item_id(conn, item_name)
+                    
+                    # Insert with location
+                    conn.execute(
+                        "INSERT INTO transfers(item_id, d, type, received_qty, notes, location, created_at) VALUES (?,?,?,?,?,?,?)",
+                        (item_id, entry_date.isoformat(), "Received", qty, notes, location, ts),
+                    )
+                    created += 1
+                    items_received.append((item_name, qty))
+                
+                conn.commit()
+                
+                if items_received:
+                    message = format_received_message_with_location(items_received, entry_date, notes, manager, location)
+                    success = tg_send_with_retry(CHAT_RECEIVED, message)
+                
+    except Exception as e:
+        LOG.error("Submit failed for %s - %s: %s", entry_type, location, e)
+        raise
+        
+    return created
+
+def handle_submit(entry_type: str, entry_date: date, manager: str, notes: str, qty_inputs: Dict[str, Optional[float]]) -> int:
+    """Backward compatibility - defaults to Avondale location"""
+    return handle_submit_with_location(entry_type, entry_date, manager, notes, qty_inputs, 'Avondale')
+
+# Store auto-request data for shortage tracking
+def store_auto_request_data(requests: List[Tuple[str, float, float, float]], request_date: date, delivery_date: date):
+    """Store auto-request data for shortage comparison later."""
+    try:
+        with get_db_connection() as conn:
+            ts = now_local().isoformat()
+            
+            for name, req_qty, on_hand, adu in requests:
+                if req_qty > 0:  # Only store items that were actually requested
+                    # Get item ID
+                    item_id = conn.execute("SELECT id FROM items WHERE name = ?", (name,)).fetchone()
+                    if item_id:
+                        conn.execute(
+                            "INSERT INTO auto_requests(item_id, request_date, delivery_date, requested_qty, on_hand_qty, created_at) VALUES (?,?,?,?,?,?)",
+                            (item_id["id"], request_date.isoformat(), delivery_date.isoformat(), req_qty, on_hand, ts)
+                        )
+            
+            conn.commit()
+            LOG.info(f"Stored auto-request data for {len([r for r in requests if r[1] > 0])} items")
+            
+    except Exception as e:
+        LOG.error(f"Failed to store auto-request data: {e}")
+
+# ---------------------- Scheduled Jobs --------------------
+
+def get_item_status_for_date_location(conn: sqlite3.Connection, d: date, location: str) -> List[ItemStatus]:
+    """Get item status for specific location and date."""
+    items_status = []
+    
+    # Get items for this location
+    items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
+    
+    for name, config in items_config.items():
+        adu = config["adu"]
+        par_level = config["par_level"]
+        unit_type = config["unit_type"]
+        
+        # Get item ID
+        item_row = conn.execute("SELECT id FROM items WHERE name = ?", (name,)).fetchone()
+        if not item_row:
+            continue
+            
+        item_id = item_row["id"]
+        
+        # Get on-hand quantity for this date and location
+        oh_row = conn.execute(
+            "SELECT qty FROM nightly_on_hand WHERE item_id=? AND d=? AND location=?",
+            (item_id, d.isoformat(), location),
+        ).fetchone()
+        
+        qty = float(oh_row["qty"]) if oh_row and oh_row["qty"] is not None else None
+        
+        # Use location-aware status calculation
+        status = calculate_item_status_location(name, qty, d, adu, par_level, unit_type, location)
+        items_status.append(status)
+    
+    return items_status
+
+def get_item_status_for_date(conn: sqlite3.Connection, d: date) -> List[ItemStatus]:
+    """Backward compatibility - defaults to Avondale location"""
+    return get_item_status_for_date_location(conn, d, 'Avondale')
+
+def generate_location_requests(location: str, run_weekday: int, oh_by_item: Dict[str, Tuple[float, str]]) -> List[Tuple[str, float, float, float, str]]:
+    """Generate requests for specific location."""
+    items_config = AVONDALE_ITEMS if location == 'Avondale' else COMMISSARY_ITEMS
+    
+    # Use location-specific windows
+    if location == 'Commissary':
+        windows = COMMISSARY_REQUEST_WINDOWS
+    else:
+        windows = AVONDALE_REQUEST_WINDOWS
+        
+    window = windows.get(run_weekday, {"label": "Next Delivery", "total_days": 6.5})
+    total_days = window["total_days"] + DEFAULT_BUFFER_DAYS
+    
+    requests = []
+    for name, config in items_config.items():
+        adu = config["adu"]
+        unit_type = config["unit_type"]
+        oh_qty, _ = oh_by_item.get(name, (0.0, unit_type))
+        
+        needed = adu * total_days
+        req = max(0.0, needed - oh_qty)
+        rounded = math.ceil(req) if req > 0 else 0.0
+        
+        requests.append((name, rounded, oh_qty, adu, unit_type))
+    
+    return requests
+
+def auto_request_quantities(run_weekday: int, oh_by_item: Dict[str, Tuple[float, str]]) -> List[Tuple[str, float, float, float, str]]:
+    """Backward compatibility - defaults to Avondale location"""
+    return generate_location_requests('Avondale', run_weekday, oh_by_item)
+
+def job_auto_request():
+    """FIXED: Auto-request job with location-aware calculations."""
+    try:
+        with get_db_connection() as conn:
+            now = now_local()
+            wd = now.weekday()
+            
+            # Check if today is a request day for any location
+            is_avondale_day = wd in AVONDALE_REQUEST_WINDOWS
+            is_commissary_day = wd in COMMISSARY_REQUEST_WINDOWS
+            
+            if not (is_avondale_day or is_commissary_day):
+                return
+                
+            LOG.info("Auto-request job running for applicable locations")
+            
+            # Use most recent available data (today first, then yesterday)
+            today = now.date()
+            oh_map = map_oh_for_date_flexible(conn, today)
+            
+            # Check data completeness per location
+            avondale_data = sum(1 for name, (qty, _) in oh_map.items() if name in AVONDALE_ITEMS and qty > 0)
+            commissary_data = sum(1 for name, (qty, _) in oh_map.items() if name in COMMISSARY_ITEMS and qty > 0)
+            
+            # Process Avondale if it's their day and they have data
+            if is_avondale_day and avondale_data > 5:  # At least 5 items with data
+                avondale_requests = generate_location_requests('Avondale', wd, oh_map)
+                delivery_date = next_delivery_after_location(today, 'Avondale')
+                
+                # Store request data for shortage tracking
+                store_auto_request_data(
+                    [(name, req_qty, on_hand, adu) for name, req_qty, on_hand, adu, unit_type in avondale_requests],
+                    today, delivery_date
+                )
+                
+                # Send two messages
+                info_message = format_auto_request_info_message_location(avondale_requests, wd, today, 'Avondale')
+                order_message = format_location_order_message(avondale_requests, wd, today, 'Avondale')
+                
+                tg_send_with_retry(CHAT_AUTOREQUEST, info_message)
+                time_module.sleep(2)
+                tg_send_with_retry(CHAT_AUTOREQUEST, order_message)
+                
+                LOG.info("Avondale auto-request messages sent")
+            elif is_avondale_day:
+                alert_msg = f"<b>⚠️ AVONDALE AUTO-REQUEST SKIPPED</b>\nInsufficient recent on-hand data\nNeed at least 5 items with quantities"
+                tg_send_with_retry(CHAT_AUTOREQUEST, alert_msg)
+            
+            # Process Commissary if it's their day and they have data
+            if is_commissary_day and commissary_data > 3:  # At least 3 items with data
+                commissary_requests = generate_location_requests('Commissary', wd, oh_map)
+                delivery_date = next_delivery_after_location(today, 'Commissary')
+                
+                # Store request data for shortage tracking  
+                store_auto_request_data(
+                    [(name, req_qty, on_hand, adu) for name, req_qty, on_hand, adu, unit_type in commissary_requests],
+                    today, delivery_date
+                )
+                
+                # Send two messages
+                info_message = format_auto_request_info_message_location(commissary_requests, wd, today, 'Commissary')
+                order_message = format_location_order_message(commissary_requests, wd, today, 'Commissary')
+                
+                time_module.sleep(3 if is_avondale_day else 0)  # Delay if both locations
+                tg_send_with_retry(CHAT_AUTOREQUEST, info_message)
+                time_module.sleep(2)
+                tg_send_with_retry(CHAT_AUTOREQUEST, order_message)
+                
+                LOG.info("Commissary auto-request messages sent")
+            elif is_commissary_day:
+                alert_msg = f"<b>⚠️ COMMISSARY AUTO-REQUEST SKIPPED</b>\nInsufficient recent on-hand data\nNeed at least 3 items with quantities"
+                tg_send_with_retry(CHAT_AUTOREQUEST, alert_msg)
+            
+    except Exception as e:
+        LOG.exception("Auto-request job failed: %s", e)
+
+def job_reassurance():
+    """FIXED: Reassurance job with location-aware messaging."""
+    try:
+        with get_db_connection() as conn:
+            d = today_local()
+            
+            # Get status for both locations
+            avondale_status = get_item_status_for_date_location(conn, d, 'Avondale')
+            commissary_status = get_item_status_for_date_location(conn, d, 'Commissary')
+            
+            # Check if we have data for today for either location
+            avondale_data = sum(1 for item in avondale_status if item.qty is not None)
+            commissary_data = sum(1 for item in commissary_status if item.qty is not None)
+            
+            if avondale_data > 0:
+                avondale_message = format_reassurance_message_location(avondale_status, d, 'Avondale')
+                tg_send_with_retry(CHAT_REASSURANCE, avondale_message)
+                
+            if commissary_data > 0:
+                commissary_message = format_reassurance_message_location(commissary_status, d, 'Commissary')
+                tg_send_with_retry(CHAT_REASSURANCE, commissary_message)
+                
+            if avondale_data == 0 and commissary_data == 0:
+                no_data_msg = f"⚠️ <b>REASSURANCE ALERT</b>\nNo inventory data for either location today ({d.strftime('%a %b %d, %Y')})\n\nPlease ensure inventory counts are entered for accurate monitoring."
+                tg_send_with_retry(CHAT_REASSURANCE, no_data_msg)
+            
+    except Exception as e:
+        LOG.exception("Reassurance job failed: %s", e)
+
+def job_missing_counts():
+    """FIXED: Missing counts job with location support."""
+    try:
+        with get_db_connection() as conn:
+            d = today_local()
+            
+            # Check both locations
+            avondale_missing = []
+            commissary_missing = []
+            
+            # Check Avondale items
+            for name in AVONDALE_ITEMS.keys():
+                exists = conn.execute(
+                    "SELECT 1 FROM nightly_on_hand WHERE item_id = (SELECT id FROM items WHERE name = ?) AND d = ? AND location = 'Avondale'",
+                    (name, d.isoformat()),
+                ).fetchone()
+                if not exists:
+                    avondale_missing.append(name)
+            
+            # Check Commissary items
+            for name in COMMISSARY_ITEMS.keys():
+                exists = conn.execute(
+                    "SELECT 1 FROM nightly_on_hand WHERE item_id = (SELECT id FROM items WHERE name = ?) AND d = ? AND location = 'Commissary'",
+                    (name, d.isoformat()),
+                ).fetchone()
+                if not exists:
+                    commissary_missing.append(name)
+            
+            # Format message
+            if not avondale_missing and not commissary_missing:
+                message = f"✅ <b>ALL COUNTS PRESENT</b>\n📅 {d.strftime('%a %b %d, %Y')}\n\nNo missing inventory counts detected for either location.\n\n🎉 Great job keeping data complete!"
+            else:
+                style = MessageStyle()
+                lines = []
+                
+                if avondale_missing:
+                    lines.append(f"<b>{style.WARNING} AVONDALE - MISSING COUNTS ({len(avondale_missing)} items):</b>")
+                    lines.extend(f"• {name}" for name in avondale_missing)
+                    lines.append("")
+                
+                if commissary_missing:
+                    lines.append(f"<b>{style.WARNING} COMMISSARY - MISSING COUNTS ({len(commissary_missing)} items):</b>")
+                    lines.extend(f"• {name}" for name in commissary_missing)
+                    lines.append("")
+                
+                lines.append(f"<b>Next steps:</b>")
+                lines.append(f"1️⃣ Use /entry to add missing counts")
+                lines.append(f"2️⃣ Or add via web app")
+                lines.append(f"3️⃣ Complete counts for accurate reporting")
+                
+                message = "\n".join(lines)
+            
+            tg_send_with_retry(CHAT_REASSURANCE, message)
+                
+    except Exception as e:
+        LOG.exception("Missing-counts job failed: %s", e)
+
+def job_cleanup():
+    """Daily cleanup job."""
+    try:
+        cleanup_old_data()
+    except Exception as e:
+        LOG.exception("Cleanup job failed: %s", e)
+
+# ADU management functions
+def execute_adu_info_command(chat_id: int):
+    """Show current ADU values for all items."""
+    try:
+        header = f"📊 <b>AVERAGE DAILY USAGE (ADU)</b>\n🤖 Command executed: /adu\n📅 {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        lines = [header, "\n<b>🏢 AVONDALE ITEMS:</b>"]
+        for name, config in AVONDALE_ITEMS.items():
+            unit_name = UNIT_TYPES.get(config["unit_type"], config["unit_type"])
+            lines.append(f"• <b>{name}</b>: {config['adu']} {unit_name}/day")
+        
+        lines.append(f"\n<b>🏭 COMMISSARY ITEMS:</b>")
+        for name, config in COMMISSARY_ITEMS.items():
+            unit_name = UNIT_TYPES.get(config["unit_type"],
