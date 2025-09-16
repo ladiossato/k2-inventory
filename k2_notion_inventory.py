@@ -35,8 +35,6 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from urllib.parse import quote
 
 import requests
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 SYSTEM_VERSION = "2.0.0"  # Make sure this is defined at module level
 
 # Load environment variables from .env file if it exists
