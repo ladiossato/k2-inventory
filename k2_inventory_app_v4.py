@@ -18,6 +18,7 @@
 #   streamlit run k2_inventory_app.py
 # -------------------------------------------------------------
 import json
+import atexit
 import os
 import math
 import sqlite3
@@ -38,6 +39,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 conversation_states: Dict[int, Dict[str, Any]] = {} # Global state for user conversations
+_current_handler_thread = None
+_should_stop_handler = False
+
 
 # Configure Streamlit for mobile-first design
 st.set_page_config(
@@ -141,6 +145,8 @@ def validate_environment():
     return BOT_TOKEN
 
 BOT_TOKEN = validate_environment()
+
+
 
 # Toggle testing vs production
 USE_TEST_CHAT = True   # <-- flip this between True/False
@@ -2290,37 +2296,70 @@ if st.sidebar.button("🔍 Toggle Debug"):
 # COMPLETE INTERACTIVE TELEGRAM DATA ENTRY SYSTEM
 # Replace your existing Telegram command functions with these
 
+def stop_telegram_handler():
+    """Stop the current Telegram handler."""
+    global _should_stop_handler, _current_handler_thread
+    _should_stop_handler = True
+    if _current_handler_thread:
+        LOG.info("Stopping Telegram handler...")
+        _current_handler_thread.join(timeout=5)
+
 def start_telegram_command_handler():
-    """Telegram command handler with better connection management."""
+    """Start Telegram handler with proper conflict resolution."""
+    global _current_handler_thread, _should_stop_handler
+    
     if not BOT_TOKEN:
         LOG.info("No Telegram bot token - command handler disabled")
         return
     
+    # Stop any existing handler
+    stop_telegram_handler()
+    _should_stop_handler = False
+    
+    # Clear any pending updates by getting them with a high offset
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            params={'offset': -1, 'limit': 1},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('result'):
+                last_update_id = data['result'][0]['update_id']
+                # Skip all pending updates
+                requests.get(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                    params={'offset': last_update_id + 1},
+                    timeout=5
+                )
+        LOG.info("Cleared pending Telegram updates")
+    except:
+        pass
+    
     def command_handler():
-        """Background thread for handling Telegram commands with exponential backoff."""
+        """Handler with proper conflict resolution."""
         last_update_id = 0
-        consecutive_errors = 0
         
-        while True:
+        while not _should_stop_handler:
             try:
-                # Dynamic timeout based on error count
-                timeout = min(30, 5 + consecutive_errors * 2)
-                
                 response = requests.get(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
                     params={
                         'offset': last_update_id + 1,
-                        'timeout': timeout,
+                        'timeout': 30,  # Longer timeout reduces API calls
                         'allowed_updates': ['message']
                     },
-                    timeout=timeout + 5,  # Slightly longer than Telegram timeout
+                    timeout=35,
                 )
                 
                 if response.status_code == 200:
-                    consecutive_errors = 0  # Reset error counter on success
                     data = response.json()
                     
                     for update in data.get('result', []):
+                        if _should_stop_handler:
+                            return
+                            
                         last_update_id = update['update_id']
                         
                         if 'message' in update:
@@ -2335,30 +2374,32 @@ def start_telegram_command_handler():
                                 handle_telegram_command(chat_id, command, full_message)
                             else:
                                 handle_telegram_command(chat_id, text, text)
+                
+                elif response.status_code == 409:
+                    LOG.warning("409 Conflict detected - another bot instance running. Waiting for it to stop...")
+                    time_module.sleep(60)  # Wait longer for other instance to stop
+                    
                 else:
-                    consecutive_errors += 1
                     LOG.warning(f"Telegram API returned {response.status_code}")
+                    time_module.sleep(30)
                 
             except requests.exceptions.Timeout:
-                # Timeout is normal with long polling, just continue
-                pass
-            except requests.exceptions.RequestException as e:
-                consecutive_errors += 1
-                wait_time = min(300, 30 * consecutive_errors)  # Max 5 min wait
-                LOG.error(f"Telegram connection error (will retry in {wait_time}s): {e}")
-                time_module.sleep(wait_time)
+                # Normal with long polling
+                continue
             except Exception as e:
-                consecutive_errors += 1
-                LOG.error(f"Telegram handler error: {e}")
-                time_module.sleep(60)
-            
-            # Small delay only if no timeout occurred
-            if consecutive_errors == 0:
-                time_module.sleep(0.1)
+                if not _should_stop_handler:
+                    LOG.error(f"Telegram handler error: {e}")
+                    time_module.sleep(30)
+        
+        LOG.info("Telegram handler stopped cleanly")
     
-    thread = threading.Thread(target=command_handler, daemon=True)
-    thread.start()
-    LOG.info("Telegram command handler started with improved connection management")
+    _current_handler_thread = threading.Thread(target=command_handler, daemon=True)
+    _current_handler_thread.start()
+    
+    # Register cleanup on app exit
+    atexit.register(stop_telegram_handler)
+    
+    LOG.info("Telegram command handler started with conflict resolution")
 
 class ConversationState:
     """Manages conversation state for interactive data entry."""
@@ -3511,6 +3552,13 @@ def main():
         # Initialize database
         init_db()
         
+        # Check environment
+        ENVIRONMENT = os.getenv('RAILWAY_ENVIRONMENT', 'development')
+        if ENVIRONMENT == 'production':
+            LOG.info("Running in PRODUCTION mode")
+        else:
+            LOG.info(f"Running in {ENVIRONMENT} mode")
+        
         # Only start scheduler in local development
         USE_SCHEDULER = os.getenv('USE_SCHEDULER', 'false').lower() == 'true'
         
@@ -3519,16 +3567,13 @@ def main():
             LOG.info("Scheduler started for local development")
         else:
             LOG.info("Scheduler disabled for production deployment")
-            # Start Telegram command handler instead
+            # Start Telegram command handler with proper conflict resolution
             start_telegram_command_handler()
         
-        # FIXED: Call the correct function name
-        page_entry()  # Changed from ui_entry_form() to page_entry()
+        # Call the entry page
+        page_entry()
         
     except Exception as e:
         LOG.exception("Application startup failed: %s", e)
         st.error(f"🚨 System startup failed: {str(e)}")
         st.stop()
-
-if __name__ == "__main__":
-    main()
