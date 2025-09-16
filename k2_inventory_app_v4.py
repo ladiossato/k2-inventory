@@ -3560,7 +3560,7 @@ def main():
             LOG.info(f"Running in {ENVIRONMENT} mode")
         
         # Only start scheduler in local development
-        USE_SCHEDULER = os.getenv('USE_SCHEDULER', 'false').lower() == 'true'
+        USE_SCHEDULER = os.getenv('USE_SCHEDULER', 'false').lower() == 'false'
         
         if USE_SCHEDULER:
             start_scheduler()
