@@ -1,1 +1,1 @@
-web: streamlit run k2_inventory_app_v4.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+worker: python -u k2_notion_inventory.py
